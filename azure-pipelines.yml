@@ -1,0 +1,105 @@
+trigger: none
+
+pool: rb-azdev
+#  vmImage: ubuntu-latest
+
+parameters:
+  - name: deploymentStrategy
+    displayName: Deployment Strategy
+    type: string
+    default: Canary
+    values:
+      - Canary
+      - BlueGreen
+  - name: repositoryName
+    displayName: Repository name or ID
+    type: string
+  - name: canaryIncrements
+    displayName: Canary Deployment Increments (%)
+    type: object
+    default:
+      - 10
+      - 20
+      - 70
+  - name: debug
+    displayName: 'Enable debug output'
+    type: boolean
+    default: false
+
+variables:
+  System.Debug: "${{ parameters.debug }}"
+
+stages:
+  - stage: CheckBranchPolicies
+    displayName: Check and Set Branch Policies
+    jobs:
+      - job:
+        displayName: Policy Check az
+        steps:
+          - template: templates/tasks/branch-policies-az.yml
+            parameters:
+              repositoryName: "${{ parameters.repositoryName }}"
+              minimumApproverCount: 2
+              resetVotesOnPush: true
+
+      - job:
+        displayName: Policy Check api
+        steps:
+          - template: templates/tasks/branch-policies-api.yml
+            parameters:
+              repositoryName: "${{ parameters.repositoryName }}"
+              minimumApproverCount: 2
+              resetVotesOnPush: true
+
+  - stage: Deploy
+    displayName: Deploy Application
+    dependsOn:
+      - CheckBranchPolicies
+    jobs:
+      - ${{ if eq(parameters.deploymentStrategy, 'Canary') }}:
+          - deployment: CanaryDeployment
+            displayName: Canary Deployment
+            environment: Production
+            strategy:
+              canary:
+                increments: "${{ parameters.canaryIncrements }}"
+                preDeploy:
+                  steps:
+                  - script: echo "Preparing for canary deployment"
+                    displayName: Prepare Canary
+                deploy:
+                  steps:
+                  - script: echo "Deploying to canary slice"
+                    displayName: Deploy Canary
+                routeTraffic:
+                  steps:
+                  - script: echo "Routing traffic to canary"
+                    displayName: Route Traffic
+                postRouteTraffic:
+                  steps:
+                  - script: echo "Monitoring health metrics"
+                    displayName: Monitor Canary
+
+      - ${{ if eq(parameters.deploymentStrategy, 'BlueGreen') }}:
+          - deployment: BlueGreenDeployment
+            displayName: Blue-Green Deployment
+            environment: Production
+            strategy:
+              rolling:
+                maxParallel: 1
+                preDeploy:
+                  steps:
+                  - script: echo "Preparing green environment"
+                    displayName: Prepare Green
+                deploy:
+                  steps:
+                  - script: echo "Deploying to green environment"
+                    displayName: Deploy to Green
+                routeTraffic:
+                  steps:
+                  - script: echo "Switching traffic from blue to green"
+                    displayName: Switch Traffic
+                postRouteTraffic:
+                  steps:
+                  - script: echo "Running validation tests in green environment"
+                    displayName: Validate Green
