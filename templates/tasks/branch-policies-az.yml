@@ -1,0 +1,148 @@
+# -----------------------------------------------------------------------------
+# Enforces strict branch permissions and policies on the **default branch** of a
+# specified Azure DevOps repo
+# -----------------------------------------------------------------------------
+# • Denies for *Everyone* (Project‑scope):
+#     – Force Push
+#     – Edit Policies
+#     – Bypass policies when **completing** PRs
+#     – Bypass policies when **pushing**
+# • Requires ≥ 2 reviewers and resets approvals on new pushes.
+#
+# PREREQUISITES
+#   – Pipeline variable/secret `SVC_PAT` (or use System.AccessToken instead).
+#   – Azure DevOps CLI extension available (installed automatically below).
+#
+
+parameters:
+  - name: repositoryName
+    type: string
+  - name: organizationUrl
+    type: string
+    default: "$(System.TeamFoundationCollectionUri)"
+  - name: projectName
+    type: string
+    default: "$(System.TeamProject)"
+  - name: minimumApproverCount
+    type: number
+    default: 2
+  - name: resetVotesOnPush
+    type: boolean
+    default: true
+
+steps:
+  - task: Bash@3
+    displayName: Enforce permissions & policy
+    env:
+      AZURE_DEVOPS_EXT_PAT: "$(SVC_PAT)"
+    inputs:
+      targetType: inline
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        
+        echo "##[group]Install Azure DevOps CLI"
+        az extension add --name azure-devops --only-show-errors || true
+        az devops configure --defaults organization="${{ parameters.organizationUrl }}" project="${{ parameters.projectName }}"
+        echo "##[endgroup]"
+        
+        echo "##[group]Discover repository"
+        repoId=$(az repos show --repository "${{ parameters.repositoryName }}" --query id -o tsv)
+        defaultRef=$(az repos show --repository "$repoId" --query defaultBranch -o tsv)
+        defaultBranch=${defaultRef#refs/heads/}
+        echo "Repo ID        : $repoId"
+        echo "Default branch : $defaultBranch"
+        echo "##[endgroup]"
+        
+        nsId="52d39943-cb85-4d7f-8fa8-c6baac873819"   # Git namespace GUID
+        branchHex=$(printf '%s' "$defaultBranch" | od -An -tx1 | tr -d ' \n')
+        token="repoV3/$repoId/$branchHex"
+        
+        everyone=$(az devops security group list --project "${{ parameters.projectName }}" \
+                   --query "graphGroups[?displayName=='Project Valid Users'].descriptor | [0]" -o tsv)
+        [[ -z "$everyone" ]] && \
+        everyone=$(az devops security group list \
+                   --query "graphGroups[?displayName=='Project Collection Valid Users'].descriptor | [0]" -o tsv)
+        [[ -z "$everyone" ]] && { echo "##vso[task.logissue type=error]Cannot resolve the 'Everyone' group." >&2; exit 1; }
+        
+        declare -A perms=(
+          [ForcePush]=4                 # 0x0004
+          #[EditPolicies]=2048           # 0x0800
+          [BypassPoliciesCompletion]=16384  # 0x4000
+          [BypassPoliciesPush]=32768        # 0x8000
+        )
+        
+        is_denied () {
+          local bit=${perms[$1]}
+          local deny
+          deny=$(az devops security permission list \
+                   --namespace-id "$nsId" --token "$token" --subject "$everyone" \
+                   --query "accessControlEntries[?extendedInfo.permissionBit==\`$bit\`].deny | [0]" -o tsv 2>/dev/null || echo 0)
+          [[ ${deny:-0} -ge $bit ]]
+        }
+        
+        echo "##[group]Deny branch permissions"
+        for p in "${!perms[@]}"; do
+          if is_denied "$p"; then
+            echo "✅ $p already denied"
+          else
+            echo "🔒 Denying $p"
+            az devops security permission update \
+              --namespace-id "$nsId" \
+              --subject "$everyone" \
+              --token "$token" \
+              --deny-bit ${perms[$p]} --output none
+          fi
+        done
+        echo "##[endgroup]"
+        
+        echo "##[group]Ensure minimum-reviewer policy"
+        min=${{ parameters.minimumApproverCount }}
+        reset=${{ parameters.resetVotesOnPush }}
+        
+        policyId=$(az repos policy list \
+                    --repository-id "$repoId" \
+                    --branch "$defaultBranch" \
+                    --query "[?type.displayName=='Minimum number of reviewers'] | [0].id" -o tsv)
+        
+        if [[ -n "$policyId" ]]; then
+          echo "Updating existing policy (id=$policyId)"
+          az repos policy approver-count update --id "$policyId" \
+              --minimum-approver-count "$min" \
+              --reset-on-source-push "$reset" \
+              --allow-downvotes false \
+              --blocking true \
+              --enabled true
+        else
+          echo "Creating policy"
+          az repos policy approver-count create \
+              --repository-id "$repoId" --branch "$defaultBranch" \
+              --minimum-approver-count "$min" \
+              --creator-vote-counts false --reset-on-source-push "$reset" \
+              --allow-downvotes false \
+              --blocking true \
+              --enabled true
+        fi
+        echo "##[endgroup]"
+        
+        echo "##[group]Deny 'Edit Policies'"
+        editBit=2048
+        alreadyDenied=$(az devops security permission list \
+                          --namespace-id "$nsId" \
+                          --token "$token" \
+                          --subject "$everyone" \
+                          --query "accessControlEntries[?extendedInfo.permissionBit==\`$editBit\`].deny | [0]" -o tsv 2>/dev/null || echo 0)
+        if [[ $alreadyDenied -ge $editBit ]]; then
+          echo "✅ Edit Policies already denied"
+        else
+          az devops security permission update \
+              --namespace-id "$nsId" \
+              --subject "$everyone" \
+              --token "$token" \
+              --deny-bit $editBit \
+              --output none
+          echo "🔒 Edit Policies denied"
+        fi
+        echo "##[endgroup]"
+        
+        echo "Branch protections applied ✔️"

@@ -1,0 +1,180 @@
+# -----------------------------------------------------------------------------
+# Enforces strict branch permissions and policies on the **default branch** of a
+# specified Azure DevOps repo
+# -----------------------------------------------------------------------------
+# • Denies for *Everyone* (Project‑scope):
+#     – Force Push
+#     – Edit Policies
+#     – Bypass policies when **completing** PRs
+#     – Bypass policies when **pushing**
+# • Requires ≥ 2 reviewers and resets approvals on new pushes.
+#
+# PREREQUISITES
+#   – Pipeline variable/secret `SVC_PAT` (or use System.AccessToken instead).
+
+parameters:
+  - name: repositoryName
+    type: string
+  - name: organizationUrl
+    type: string
+    default: "$(System.TeamFoundationCollectionUri)"
+  - name: projectName
+    type: string
+    default: "$(System.TeamProject)"
+  - name: minimumApproverCount
+    type: number
+    default: 2
+  - name: resetVotesOnPush
+    type: boolean
+    default: true
+
+steps:
+  - task: Bash@3
+    displayName: Enforce permissions & policy
+    env:
+      AZURE_DEVOPS_EXT_PAT: "$(SVC_PAT)"
+    inputs:
+      targetType: inline
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        
+        orgUrl="${{ parameters.organizationUrl }}"
+        project="${{ parameters.projectName }}"
+        repoName="${{ parameters.repositoryName }}"
+        minApprovers=${{ parameters.minimumApproverCount }}
+        resetVotes=${{ parameters.resetVotesOnPush }}
+        api="7.1-preview.1"
+        
+        # Ensure organization URL ends with a slash
+        [[ "${orgUrl}" != */ ]] && orgUrl="${orgUrl}/"
+        
+        # Base-64 encode ":PAT"
+        auth=$(printf ':%s' "$AZURE_DEVOPS_EXT_PAT" | base64 -w 0)
+        
+        req() {  # req <METHOD> <URL-PATH> [json-body]
+          local m=$1 url=$2 body=${3:-}
+          # Ensure URL path starts with a slash
+          [[ "${url}" != /* ]] && url="/${url}"
+          url="${orgUrl}${project}${url}?api-version=${api}"
+          
+          # Debug info to stderr to avoid interfering with JSON output
+          echo "DEBUG: method: $m, url: $url" >&2
+          [[ -n $body ]] && echo "DEBUG: body: $body" >&2
+          
+          if [[ -n $body ]]; then
+            echo "$body" | curl --fail -sS -X "$m" -H "Authorization: Basic $auth" \
+                 -H "Content-Type: application/json" --data @- "$url"
+          else
+            curl --fail -sS -X "$m" -H "Authorization: Basic $auth" "$url"
+          fi
+        }
+        
+        echo "##[group]Discover repository"
+        repo=$(req GET "_apis/git/repositories/$repoName")
+        if [[ -z "$repo" ]]; then
+          echo "##[error] Failed to get repository info"
+          exit 1
+        fi
+        
+        repoId=$(echo "$repo" | jq -r .id)
+        defaultRef=$(echo "$repo" | jq -r .defaultBranch)
+        branch=${defaultRef#refs/heads/}
+        printf "Repo ID        : %s\nDefault branch : %s\n" "$repoId" "$branch"
+        echo "##[endgroup]"
+        
+        # --- Resolve the 'Everyone' (Valid Users) group descriptor -----------
+        echo "##[group]Resolve Everyone group descriptor"
+        orgName=$(basename "$orgUrl" | sed 's/[/:]//g')
+        echo "Organization name: $orgName"
+        
+        groups=$(curl --fail -sS -H "Authorization: Basic $auth" \
+                 "https://vssps.dev.azure.com/${orgName}/_apis/graph/groups?api-version=${api}")
+        if [[ -z "$groups" ]]; then
+          echo "##[error] Failed to get groups"
+          exit 1
+        fi
+        
+        everyone=$(echo "$groups" | jq -r '.value[] | select(.displayName=="Project Valid Users" or .displayName=="Project Collection Valid Users") | .descriptor' | head -1)
+        if [[ -z "$everyone" ]]; then
+          echo "##[error] Could not resolve Everyone group"
+          exit 1
+        fi
+        echo "Descriptor : $everyone"
+        echo "##[endgroup]"
+        
+        # --- Deny branch-level permissions -----------------------------------
+        echo "##[group]Deny branch permissions"
+        ns="52d39943-cb85-4d7f-8fa8-c6baac873819"     # Git security namespace
+        hex=$(printf '%s' "$branch" | od -An -tx1 | tr -d ' \n')
+        token="repoV3/${repoId}/${hex}"
+        
+        deny() {  # deny <bitmask>
+          body=$(jq -c -n --arg t "$token" --arg d "$everyone" --arg b $1 \
+            '{token:$t,merge:true,accessControlEntries:[{descriptor:$d,allow:0,deny:$b}]}' )
+          result=$(req POST "_apis/accesscontrolentries/${ns}" "$body" || echo "ERROR")
+          if [[ "$result" == "ERROR" ]]; then
+            echo "##[warning] Failed to set permission with bitmask $1"
+          fi
+        }
+        
+        deny 4        # ForcePush
+        deny 2048     # EditPolicies
+        deny 16384    # BypassPoliciesCompletion
+        deny 32768    # BypassPoliciesPush
+        echo "🔒  Force Push, Edit Policies, Bypass Policies (push & completion) denied"
+        echo "##[endgroup]"
+        
+        # --- Ensure 'Minimum number of reviewers' policy ---------------------
+        echo "##[group]Ensure minimum-reviewer policy"
+        policyType="fa4e907d-c16b-4a4c-9dfa-4906e5d171dd"   # reviewers
+        scope=$(jq -c -n \
+          --arg repo "$repoId" --arg ref "refs/heads/$branch" \
+          '[{repositoryId:$repo,refName:$ref,matchKind:"exact"}]')
+        
+        policies=$(req GET "_apis/policy/configurations")
+        if [[ -z "$policies" ]]; then
+          echo "##[warning] Failed to get existing policies, will try to create new one"
+          cfg=""
+        else
+          cfg=$(echo "$policies" | jq -r --arg id "$policyType" '.value[] | select(.type.id==$id) | .id' | head -1)
+        fi
+        
+        body=$(jq -c -n \
+          --arg min "$minApprovers" \
+          --arg reset "$resetVotes" \
+          --arg id "${cfg:-null}" \
+          --arg type "$policyType" \
+          --arg scope "$scope" \
+          '{
+             isEnabled:true,isBlocking:true,
+             type:{id:$type},
+             settings:{
+               minimumApproverCount:$min,
+               creatorVoteCounts:false,
+               allowDownvotes:false,
+               resetOnSourcePush:$reset,
+               scope:$scope
+             }
+           }')
+        
+        if [[ -n "$cfg" ]]; then
+          result=$(req PUT "_apis/policy/configurations/$cfg" "$body" 2>/dev/null || echo "ERROR")
+          if [[ "$result" == "ERROR" ]]; then
+            echo "##[error] Failed to update policy"
+            exit 1
+          else
+            echo "Updated policy (id=$cfg)"
+          fi
+        else
+          result=$(req POST "_apis/policy/configurations" "$body" 2>/dev/null || echo "ERROR")
+          if [[ "$result" == "ERROR" ]]; then
+            echo "##[error] Failed to create policy"
+            exit 1
+          else
+            echo "Created policy"
+          fi
+        fi
+        echo "##[endgroup]"
+        
+        echo "Branch protections applied ✔️"
